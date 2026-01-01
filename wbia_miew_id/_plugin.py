@@ -17,8 +17,11 @@ import pandas as pd
 import json
 
 import tqdm
+import logging
 
 from wbia_miew_id.helpers import get_config, read_json
+
+logger = logging.getLogger('wbia')
 from wbia_miew_id.models import get_model
 from wbia_miew_id.datasets import PluginDataset, get_test_transforms
 from wbia_miew_id.metrics import pred_light, compute_distance_matrix, eval_onevsall
@@ -139,8 +142,17 @@ def miew_id_embedding(ibs, aid_list, config=None, use_depc=True):
 
     if len(dirty_aids) > 0:
         print('Computing %d non-cached embeddings' % (len(dirty_aids), ))
+        logger.info(f"[MiewID] miew_id_embedding - config type: {type(config)}, config: {config}")
         if use_depc:
-            config_map = {'config_path': config}
+            # Preserve miewid_model_key if config is a dict, otherwise use config_path
+            if isinstance(config, dict):
+                config_map = config.copy()  # Preserve all config including miewid_model_key
+                if 'config_path' not in config_map:
+                    config_map['config_path'] = None
+                logger.info(f"[MiewID] miew_id_embedding - use_depc=True, config_map: {config_map}")
+            else:
+                config_map = {'config_path': config}
+                logger.info(f"[MiewID] miew_id_embedding - use_depc=True, config is not dict, config_map: {config_map}")
             dirty_embeddings = ibs.depc_annot.get(
                 'MiewIdEmbedding', dirty_aids, 'embedding', config_map
             )
@@ -158,6 +170,7 @@ def miew_id_embedding(ibs, aid_list, config=None, use_depc=True):
 class MiewIdEmbeddingConfig(dt.Config):  # NOQA
     _param_info_list = [
         ut.ParamInfo('config_path', default=None),
+        ut.ParamInfo('miewid_model_key', default=None),  # Allow model key override
     ]
 
 
@@ -173,7 +186,34 @@ class MiewIdEmbeddingConfig(dt.Config):  # NOQA
 @register_ibs_method
 def miew_id_embedding_depc(depc, aid_list, config=None):
     ibs = depc.controller
-    embs = miew_id_compute_embedding(ibs, aid_list, config=config['config_path'])
+    # Pass the full config dict to preserve miewid_model_key
+    # Config can be a dict or a Config object (MiewIdEmbeddingConfig)
+    logger.info(f"[MiewID] miew_id_embedding_depc - config type: {type(config)}, config: {config}")
+    if isinstance(config, dict):
+        embedding_config = config  # Pass full config dict to preserve miewid_model_key
+        logger.info(f"[MiewID] miew_id_embedding_depc - Using dict config, embedding_config: {embedding_config}")
+    else:
+        # Config object (MiewIdEmbeddingConfig) - extract miewid_model_key if present
+        embedding_config = None
+        if config and hasattr(config, 'get'):
+            # Config objects support .get() method
+            miewid_model_key = config.get('miewid_model_key', None)
+            if miewid_model_key:
+                embedding_config = {'miewid_model_key': miewid_model_key}
+                logger.info(f"[MiewID] miew_id_embedding_depc - Extracted miewid_model_key from Config object: '{miewid_model_key}'")
+            else:
+                logger.info(f"[MiewID] miew_id_embedding_depc - No miewid_model_key in Config object, using default behavior")
+        elif config and hasattr(config, 'miewid_model_key'):
+            # Fallback: try direct attribute access
+            miewid_model_key = getattr(config, 'miewid_model_key', None)
+            if miewid_model_key:
+                embedding_config = {'miewid_model_key': miewid_model_key}
+                logger.info(f"[MiewID] miew_id_embedding_depc - Extracted miewid_model_key from Config attribute: '{miewid_model_key}'")
+            else:
+                logger.info(f"[MiewID] miew_id_embedding_depc - Config has miewid_model_key attribute but value is None, using default behavior")
+        else:
+            logger.info(f"[MiewID] miew_id_embedding_depc - config is None or has no get method, embedding_config: {embedding_config}")
+    embs = miew_id_compute_embedding(ibs, aid_list, config=embedding_config)
     for aid, emb in zip(aid_list, embs):
         yield (np.array(emb),)
 
@@ -182,6 +222,17 @@ def miew_id_embedding_depc(depc, aid_list, config=None):
 def miew_id_compute_embedding(ibs, aid_list, config=None, multithread=False):
     # Get species from the first annotation
     species = ibs.get_annot_species_texts(aid_list[0])
+    logger.info(f"[MiewID] miew_id_compute_embedding - config type: {type(config)}, config: {config}, species from DB: '{species}'")
+    
+    # Allow override of model key from config parameter (if provided)
+    # If config is a dict with 'miewid_model_key', use that instead of species
+    if isinstance(config, dict) and config.get('miewid_model_key'):
+        model_key = config['miewid_model_key']
+        logger.info(f"[MiewID] Using model key from config: '{model_key}' (overriding species: '{species}')")
+        species = model_key
+    else:
+        logger.info(f"[MiewID] No model key override found, using species from database: '{species}'")
+    # Otherwise, use default behavior (species-based lookup)
 
     # Load model
     model, config, (model_url, config_url) = read_config_and_load_model(species)
@@ -214,6 +265,7 @@ class MiewIdConfig(dt.Config):  # NOQA
         return [
             ut.ParamInfo('config_path', None),
             ut.ParamInfo('use_knn', True, hideif=True),
+            ut.ParamInfo('miewid_model_key', None),  # Override model key for model selection
         ]
 
 
@@ -287,8 +339,15 @@ class MiewIdRequest(dt.base.VsOneSimilarityRequest):
         depc = request.depc
         ibs = depc.controller
 
-        # Load config
+        # Load config - use model key override if available
         species = ibs.get_annot_species_texts(aids)[0]
+        request_config = request.config if hasattr(request, 'config') else {}
+        # Config objects support .get() method (DictLike interface), same as wbia_plugin_miew_id
+        miewid_model_key = request_config.get('miewid_model_key', None) if hasattr(request_config, 'get') else None
+        
+        if miewid_model_key:
+            logger.info(f"[MiewID] render_batch_result - Using model key from request config: '{miewid_model_key}' (overriding species: '{species}')")
+            species = miewid_model_key
         model, config, (model_url, config_url) = read_config_and_load_model(species)
         # This list has to be in the format of [query_aid, db_aid]
         aid_list = np.concatenate(([cm.qaid],  aids))
@@ -307,8 +366,18 @@ class MiewIdRequest(dt.base.VsOneSimilarityRequest):
 
         depc = request.depc
         ibs = depc.controller
+        config = request.config if hasattr(request, 'config') else {}
+        logger.info(f"[MiewID] postprocess_execute - config type: {type(config)}, has get: {hasattr(config, 'get')}")
         for cm in cm_list:
             species = ibs.get_annot_species_texts(cm.qaid)
+            # Use model key override if available
+            # Config objects support .get() method (DictLike interface), same as wbia_plugin_miew_id
+            miewid_model_key = config.get('miewid_model_key', None) if hasattr(config, 'get') else None
+            logger.info(f"[MiewID] postprocess_execute - species: '{species}', miewid_model_key: '{miewid_model_key}'")
+            
+            if miewid_model_key:
+                logger.info(f"[MiewID] postprocess_execute - Using model key from request config: '{miewid_model_key}' (overriding species: '{species}')")
+                species = miewid_model_key
             _, _, (model_url, config_url) = read_config_and_load_model(species)
             cm.model_url = model_url
             cm.config_url = config_url
@@ -343,6 +412,11 @@ def wbia_plugin_miew_id(depc, qaid_list, daid_list, config):
     daids = list(set(daid_list))
 
     use_knn = config.get('use_knn', True)
+    
+    # Get model key override from config if provided
+    # If not provided, None will be passed and default behavior (species-based) will be used
+    miewid_model_key = config.get('miewid_model_key', None)
+    miewid_config_dict = {'miewid_model_key': miewid_model_key} if miewid_model_key else None
 
     qaid_score_dict = {}
     for qaid in tqdm.tqdm(qaids):
@@ -350,7 +424,7 @@ def wbia_plugin_miew_id(depc, qaid_list, daid_list, config):
                 miew_id_dists = ibs.miew_id_predict_light(
                     qaid,
                     daids,
-                    config['config_path'],
+                    config=miewid_config_dict,  # Pass model key override if provided, None otherwise
                 )
                 miew_id_scores = distance_dicts_to_score_dicts(miew_id_dists)
 
@@ -363,7 +437,7 @@ def wbia_plugin_miew_id(depc, qaid_list, daid_list, config):
             miew_id_annot_distances = ibs.miew_id_predict_light_distance(
                 qaid,
                 daids,
-                config['config_path'],
+                config=miewid_config_dict,  # Pass model key override if provided, None otherwise
             )
             qaid_score_dict[qaid] = {}
             for daid, miew_id_annot_distance in zip(daids, miew_id_annot_distances):
